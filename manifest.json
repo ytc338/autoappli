@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "AutoAppli",
+  "version": "1.0.0",
+  "description": "Auto-generate job application answers with Gemini",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["*://generativelanguage.googleapis.com/*"],
+  "action": {
+    "default_popup": "index.html"
+  },
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/index.ts"]
+    }
+  ]
+}
