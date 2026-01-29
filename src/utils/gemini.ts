@@ -27,9 +27,12 @@ Requirements:
   try {
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    return response.text().trim();
-  } catch (error) {
+    const text = response.text().trim();
+    if (!text) throw new Error("Gemini returned empty response.");
+    return text;
+  } catch (error: any) {
     console.error("Gemini API Error:", error);
-    throw new Error("Failed to generate answer. Check your API Key or try again.");
+    const errorMessage = error.message || error.toString();
+    throw new Error(`Gemini Error: ${errorMessage}`);
   }
 }

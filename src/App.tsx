@@ -8,10 +8,34 @@ function App() {
   const [status, setStatus] = useState<string>('');
   const [generatedAnswer, setGeneratedAnswer] = useState<string>('');
 
+  const TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
   useEffect(() => {
     storage.get(['geminiApiKey', 'userResume']).then((data) => {
       if (data.geminiApiKey) setApiKey(data.geminiApiKey);
       if (data.userResume) setResume(data.userResume);
+    });
+
+    // Check for saved answer for the current URL
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0];
+      const currentUrl = tab?.url;
+      
+      if (currentUrl) {
+        storage.get(['savedAnswers']).then((data) => {
+          const answers = data.savedAnswers || {};
+          const saved = answers[currentUrl];
+          
+          if (saved && saved.text && saved.timestamp) {
+             if (Date.now() - saved.timestamp < TTL) {
+                 setGeneratedAnswer(saved.text);
+             }
+          } else if (typeof saved === 'string') {
+             // Legacy string support (optional, or just overwrite)
+             setGeneratedAnswer(saved);
+          }
+        });
+      }
     });
   }, []);
 
@@ -35,24 +59,24 @@ function App() {
     
     try {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      const activeTab = tabs[0];
+      const currentTab = tabs[0];
       
-      if (!activeTab?.id) {
+      if (!currentTab?.id) {
         setStatus('Error: No active tab found.');
         return;
       }
 
-      if (activeTab.url?.startsWith('chrome://') || activeTab.url?.startsWith('edge://')) {
+      if (currentTab.url?.startsWith('chrome://') || currentTab.url?.startsWith('edge://')) {
           setStatus('Cannot scan browser settings pages.');
           return;
       }
       
-      if (activeTab.url?.startsWith('https://chrome.google.com/webstore')) {
+      if (currentTab.url?.startsWith('https://chrome.google.com/webstore')) {
           setStatus('Cannot scan Chrome Web Store.');
           return;
       }
 
-      chrome.tabs.sendMessage(activeTab.id, { action: 'scan_page' }, async (response: any) => {
+      chrome.tabs.sendMessage(currentTab.id, { action: 'scan_page' }, async (response: any) => {
         if (chrome.runtime.lastError) {
           console.error(chrome.runtime.lastError);
           // If we can't connect, it often means the script isn't injected (invalidated context or restricted page)
@@ -65,7 +89,24 @@ function App() {
            try {
              const { generateAnswer } = await import('./utils/gemini');
              const answer = await generateAnswer(apiKey, resume, response.data);
+             
+             if (!answer) {
+                 throw new Error("Received empty answer from AI");
+             }
+
              setGeneratedAnswer(answer);
+             
+             // Save URL-specific answer with TTL
+             if (currentTab.url) {
+                 const data = await storage.get(['savedAnswers']);
+                 const answers = data.savedAnswers || {};
+                 answers[currentTab.url] = {
+                     text: answer,
+                     timestamp: Date.now()
+                 };
+                 await storage.set({ savedAnswers: answers });
+             }
+             
              setStatus('Done! Answer generated.');
            } catch (err: any) {
              setStatus('Error: ' + (err.message || String(err)));
