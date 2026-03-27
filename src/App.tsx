@@ -1,5 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { storage } from './utils/storage';
+
+interface ScanPreview {
+  companyName: string;
+  jobTitle: string;
+  description: string;
+  url: string;
+}
 
 function App() {
   const [apiKey, setApiKey] = useState('');
@@ -7,8 +14,72 @@ function App() {
   const [activeTab, setActiveTab] = useState<'generate' | 'settings'>('generate');
   const [status, setStatus] = useState<string>('');
   const [generatedAnswer, setGeneratedAnswer] = useState<string>('');
+  const [isGenerating, setIsGenerating] = useState(false);
+
+  // Preview state — populated by auto-scan on popup open
+  const [preview, setPreview] = useState<ScanPreview | null>(null);
+  const [editCompany, setEditCompany] = useState('');
+  const [editJobTitle, setEditJobTitle] = useState('');
+  const [isScanning, setIsScanning] = useState(false);
+
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+
+  const startPolling = () => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      const data = await storage.get(['generationJob']);
+      const job = data.generationJob;
+      if (!job) return;
+
+      if (job.status === 'scanning') {
+        setStatus('Scanning page...');
+      } else if (job.status === 'generating') {
+        setStatus('Generating answer with Gemini...');
+      } else if (job.status === 'done') {
+        setGeneratedAnswer(job.answer || '');
+        setStatus('Done! Answer generated.');
+        setIsGenerating(false);
+        stopPolling();
+        await chrome.storage.local.remove('generationJob');
+      } else if (job.status === 'error') {
+        setStatus('Error: ' + (job.error || 'Unknown error'));
+        setIsGenerating(false);
+        stopPolling();
+        await chrome.storage.local.remove('generationJob');
+      }
+    }, 500);
+  };
+
+  // Auto-scan the page when popup opens to populate preview
+  const runScanPreview = () => {
+    setIsScanning(true);
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const currentTab = tabs[0];
+      if (!currentTab?.id || currentTab.url?.startsWith('chrome://') || currentTab.url?.startsWith('edge://')) {
+        setIsScanning(false);
+        return;
+      }
+
+      chrome.tabs.sendMessage(currentTab.id, { action: 'scan_page' }, (response: any) => {
+        setIsScanning(false);
+        if (chrome.runtime.lastError || !response?.success) return;
+
+        const data = response.data as ScanPreview;
+        setPreview(data);
+        setEditCompany(data.companyName);
+        setEditJobTitle(data.jobTitle);
+      });
+    });
+  };
 
   useEffect(() => {
     storage.get(['geminiApiKey', 'userResume']).then((data) => {
@@ -16,27 +87,49 @@ function App() {
       if (data.userResume) setResume(data.userResume);
     });
 
+    // Check for in-progress job first
+    storage.get(['generationJob']).then((data) => {
+      const job = data.generationJob;
+      if (job && (job.status === 'scanning' || job.status === 'generating')) {
+        setIsGenerating(true);
+        if (job.status === 'scanning') setStatus('Scanning page...');
+        else setStatus('Generating answer with Gemini...');
+        startPolling();
+      } else if (job && job.status === 'done') {
+        setGeneratedAnswer(job.answer || '');
+        setStatus('Done! Answer generated.');
+        chrome.storage.local.remove('generationJob');
+      } else if (job && job.status === 'error') {
+        setStatus('Error: ' + (job.error || 'Unknown error'));
+        chrome.storage.local.remove('generationJob');
+      }
+    });
+
     // Check for saved answer for the current URL
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0];
       const currentUrl = tab?.url;
-      
+
       if (currentUrl) {
         storage.get(['savedAnswers']).then((data) => {
           const answers = data.savedAnswers || {};
           const saved = answers[currentUrl];
-          
+
           if (saved && saved.text && saved.timestamp) {
-             if (Date.now() - saved.timestamp < TTL) {
-                 setGeneratedAnswer(saved.text);
-             }
+            if (Date.now() - saved.timestamp < TTL) {
+              setGeneratedAnswer(saved.text);
+            }
           } else if (typeof saved === 'string') {
-             // Legacy string support (optional, or just overwrite)
-             setGeneratedAnswer(saved);
+            setGeneratedAnswer(saved);
           }
         });
       }
     });
+
+    // Auto-scan for preview
+    runScanPreview();
+
+    return () => stopPolling();
   }, []);
 
   const saveSettings = async () => {
@@ -54,94 +147,61 @@ function App() {
       setStatus('Please save your Resume in Settings first.');
       return;
     }
+    if (!preview) {
+      setStatus('Could not scan page. Try reloading.');
+      return;
+    }
 
-    setStatus('Scanning page...');
-    
+    setStatus('Generating answer with Gemini...');
+    setIsGenerating(true);
+
     try {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
       const currentTab = tabs[0];
-      
+
       if (!currentTab?.id) {
         setStatus('Error: No active tab found.');
+        setIsGenerating(false);
         return;
       }
 
-      if (currentTab.url?.startsWith('chrome://') || currentTab.url?.startsWith('edge://')) {
-          setStatus('Cannot scan browser settings pages.');
-          return;
-      }
-      
-      if (currentTab.url?.startsWith('https://chrome.google.com/webstore')) {
-          setStatus('Cannot scan Chrome Web Store.');
-          return;
-      }
-
-      chrome.tabs.sendMessage(currentTab.id, { action: 'scan_page' }, async (response: any) => {
-        if (chrome.runtime.lastError) {
-          console.error(chrome.runtime.lastError);
-          // If we can't connect, it often means the script isn't injected (invalidated context or restricted page)
-          setStatus('Error: Could not connect. Try reloading the page.');
-          return;
+      // Use the user-edited values merged with the scan data
+      chrome.runtime.sendMessage(
+        {
+          action: 'start_generation',
+          tabId: currentTab.id,
+          apiKey,
+          resume,
+          url: currentTab.url,
+          // Pass the user-confirmed/edited scan data so background skips re-scanning
+          scannedData: {
+            companyName: editCompany || preview.companyName,
+            jobTitle: editJobTitle || preview.jobTitle,
+            description: preview.description,
+            url: preview.url,
+          },
+        },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            setStatus('Error: ' + chrome.runtime.lastError.message);
+            setIsGenerating(false);
+            return;
+          }
+          if (response?.started) {
+            startPolling();
+          }
         }
-
-        if (response && response.success) {
-           setStatus('Generating answer with Gemini...');
-           try {
-             const { generateAnswer } = await import('./utils/gemini');
-             const answer = await generateAnswer(apiKey, resume, response.data);
-             
-             if (!answer) {
-                 throw new Error("Received empty answer from AI");
-             }
-
-             setGeneratedAnswer(answer);
-             
-             // Save URL-specific answer with TTL
-             if (currentTab.url) {
-                 const data = await storage.get(['savedAnswers']);
-                 const answers = data.savedAnswers || {};
-                 answers[currentTab.url] = {
-                     text: answer,
-                     timestamp: Date.now()
-                 };
-                 await storage.set({ savedAnswers: answers });
-             }
-             
-             setStatus('Done! Answer generated.');
-           } catch (err: any) {
-             setStatus('Error: ' + (err.message || String(err)));
-           }
-        } else {
-           setStatus('Error scanning page: ' + (response?.error || 'Unknown error'));
-        }
-      });
+      );
     } catch (e: any) {
-      setStatus('Dev mode / Error: ' + (e.message || String(e)));
-      // For dev testing outside connection
-      setTimeout(async () => {
-         const { generateAnswer } = await import('./utils/gemini');
-         // Mock data for dev
-         const mockData = {
-           companyName: "Google", 
-           jobTitle: "Software Engineer", 
-           description: "Build cool stuff.",
-           url: "https://google.com"
-         };
-         try {
-            const answer = await generateAnswer(apiKey, resume, mockData);
-            setGeneratedAnswer(answer);
-            setStatus('Dev Mode: Done!');
-         } catch(err: any) {
-             setStatus('Error: ' + (err.message || String(err)));
-         }
-      }, 1000);
+      setStatus('Error: ' + (e.message || String(e)));
+      setIsGenerating(false);
     }
   };
-  
+
   const copyToClipboard = () => {
-      navigator.clipboard.writeText(generatedAnswer);
-      setStatus('Copied to clipboard!');
-      setTimeout(() => setStatus(''), 2000);
+    navigator.clipboard.writeText(generatedAnswer);
+    setStatus('Copied to clipboard!');
+    setTimeout(() => setStatus(''), 2000);
   };
 
   return (
@@ -149,13 +209,13 @@ function App() {
       <header className="mb-4 flex justify-between items-center border-b pb-2 border-slate-200">
         <h1 className="text-xl font-bold text-indigo-600">AutoAppli</h1>
         <div className="space-x-2 text-sm">
-          <button 
+          <button
             onClick={() => setActiveTab('generate')}
             className={`px-2 py-1 rounded ${activeTab === 'generate' ? 'bg-indigo-100 text-indigo-700 font-semibold' : 'text-slate-500 hover:text-slate-700'}`}
           >
             Generate
           </button>
-          <button 
+          <button
             onClick={() => setActiveTab('settings')}
             className={`px-2 py-1 rounded ${activeTab === 'settings' ? 'bg-indigo-100 text-indigo-700 font-semibold' : 'text-slate-500 hover:text-slate-700'}`}
           >
@@ -169,8 +229,8 @@ function App() {
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Gemini API Key</label>
-              <input 
-                type="password" 
+              <input
+                type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-sm"
@@ -179,14 +239,14 @@ function App() {
             </div>
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">Your Resume (Text)</label>
-              <textarea 
+              <textarea
                 value={resume}
                 onChange={(e) => setResume(e.target.value)}
                 className="w-full h-40 p-2 border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-xs"
                 placeholder="Paste your resume text here..."
               />
             </div>
-            <button 
+            <button
               onClick={saveSettings}
               className="w-full py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 transition-colors font-medium text-sm"
             >
@@ -197,34 +257,78 @@ function App() {
 
         {activeTab === 'generate' && (
           <div className="space-y-4">
-             <div className="p-3 bg-white border border-slate-200 rounded shadow-sm">
-                <p className="text-xs text-slate-500 mb-2">Instructions: Navigate to a job application page, then click Generate.</p>
-                <button 
-                  onClick={handleGenerate}
-                  className="w-full py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 transition-colors font-medium text-sm flex justify-center items-center gap-2"
-                >
-                  <span>✨</span> Generate Answer
-                </button>
-             </div>
+            {/* Scan preview */}
+            <div className="p-3 bg-white border border-slate-200 rounded shadow-sm space-y-3">
+              {isScanning ? (
+                <p className="text-xs text-slate-400 text-center py-2">Scanning page...</p>
+              ) : preview ? (
+                <>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 mb-0.5">Company</label>
+                    <input
+                      type="text"
+                      value={editCompany}
+                      onChange={(e) => setEditCompany(e.target.value)}
+                      className="w-full p-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 mb-0.5">Position</label>
+                    <input
+                      type="text"
+                      value={editJobTitle}
+                      onChange={(e) => setEditJobTitle(e.target.value)}
+                      className="w-full p-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs text-slate-400 text-center py-2">Navigate to a job page and open this popup to scan.</p>
+              )}
 
-             {generatedAnswer && (
-                 <div className="mt-4">
-                     <div className="flex justify-between items-center mb-1">
-                        <label className="text-sm font-medium text-slate-700">Generated Answer:</label>
-                        <button onClick={copyToClipboard} className="text-xs text-indigo-600 hover:text-indigo-800">Copy</button>
-                     </div>
-                     <textarea 
-                        readOnly
-                        value={generatedAnswer}
-                        className="w-full h-48 p-2 border border-slate-300 rounded bg-slate-50 text-xs resize-none focus:outline-none"
-                     />
-                 </div>
-             )}
+              <button
+                onClick={handleGenerate}
+                disabled={isGenerating || !preview}
+                className={`w-full py-2 text-white rounded transition-colors font-medium text-sm flex justify-center items-center gap-2 ${
+                  isGenerating || !preview
+                    ? 'bg-indigo-400 cursor-not-allowed'
+                    : 'bg-indigo-600 hover:bg-indigo-700'
+                }`}
+              >
+                {isGenerating ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    {status || 'Generating...'}
+                  </>
+                ) : (
+                  <>
+                    <span>✨</span> Generate Answer
+                  </>
+                )}
+              </button>
+            </div>
+
+            {generatedAnswer && (
+              <div className="mt-4">
+                <div className="flex justify-between items-center mb-1">
+                  <label className="text-sm font-medium text-slate-700">Generated Answer:</label>
+                  <button onClick={copyToClipboard} className="text-xs text-indigo-600 hover:text-indigo-800">Copy</button>
+                </div>
+                <textarea
+                  readOnly
+                  value={generatedAnswer}
+                  className="w-full h-48 p-2 border border-slate-300 rounded bg-slate-50 text-xs resize-none focus:outline-none"
+                />
+              </div>
+            )}
           </div>
         )}
       </main>
 
-      {status && (
+      {status && !isGenerating && (
         <div className="fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white text-xs py-1 px-3 rounded-full opacity-90 shadow-lg">
           {status}
         </div>
