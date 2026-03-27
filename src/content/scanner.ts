@@ -6,7 +6,7 @@ export interface ScannedData {
 }
 
 function detectActiveContext(): ParentNode {
-  // Look for common modal patterns
+  // Look for common modal / overlay / drawer patterns
   const selectors = [
     '[role="dialog"]',
     '[aria-modal="true"]',
@@ -14,21 +14,33 @@ function detectActiveContext(): ParentNode {
     '.popup',
     '.dialog',
     '[class*="modal"]',
-    '[class*="popup"]'
+    '[class*="popup"]',
+    '[class*="overlay"]',
+    '[class*="drawer"]',
+    '[class*="slide"]',
+    '[class*="flyout"]',
+    '[class*="side-panel"]',
+    '[class*="sidepanel"]',
+    '[class*="pane"]',
   ];
 
-  // Find all matching elements and return the one with the highest z-index or the last one (assumed to be on top)
+  // Find all matching elements that are visible and meaningfully sized
   const candidates = Array.from(document.querySelectorAll(selectors.join(',')))
     .filter(el => {
       const style = window.getComputedStyle(el);
-      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+      // Must have meaningful content (not just a tiny wrapper)
+      const rect = el.getBoundingClientRect();
+      return rect.width > 200 && rect.height > 200;
     });
 
   if (candidates.length > 0) {
-    // Sort by checking which one is deepest or has highest z-index ideally,
-    // but often the last one in DOM closest to body end is the active one.
-    // Let's take the last visible one as a heuristic.
-    return candidates[candidates.length - 1];
+    // Prefer the candidate with the highest z-index; break ties by DOM order (last wins)
+    return candidates.reduce((best, el) => {
+      const bestZ = parseInt(window.getComputedStyle(best).zIndex) || 0;
+      const elZ = parseInt(window.getComputedStyle(el).zIndex) || 0;
+      return elZ >= bestZ ? el : best;
+    });
   }
 
   return document;
@@ -148,22 +160,32 @@ export function scanPage(): ScannedData {
   }
   
   if (!jobTitle) {
-    // Search within context first
-    const h1 = context.querySelector('h1');
-    if (h1) {
-        jobTitle = (h1 as HTMLElement).innerText.trim();
-    } else if (isModal) {
-        // If inside modal and no h1, try h2
-        const h2 = context.querySelector('h2');
-        if (h2) {
-            jobTitle = (h2 as HTMLElement).innerText.trim();
+    // Search within context first — try headings and common job-title selectors
+    const titleSelectors = [
+      'h1',
+      '[class*="jobTitle" i]',
+      '[class*="job-title" i]',
+      '[class*="job_title" i]',
+      '[data-testid*="title" i]',
+      'h2',
+    ];
+    for (const sel of titleSelectors) {
+      const el = context.querySelector(sel);
+      if (el) {
+        const text = (el as HTMLElement).innerText.trim();
+        if (text && text.length > 1 && text.length < 200) {
+          jobTitle = text;
+          break;
         }
-    } else {
-        // Fallback to global H1
-         const h1 = document.querySelector('h1');
-         if (h1) {
-             jobTitle = h1.innerText.trim();
-         }
+      }
+    }
+
+    // If context was a modal/overlay and we still have nothing, try the full document
+    if (!jobTitle && isModal) {
+      const h1 = document.querySelector('h1');
+      if (h1) {
+        jobTitle = h1.innerText.trim();
+      }
     }
   }
 

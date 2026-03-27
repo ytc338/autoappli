@@ -69,7 +69,9 @@ function App() {
         return;
       }
 
-      chrome.tabs.sendMessage(currentTab.id, { action: 'scan_page' }, (response: any) => {
+      const tabId = currentTab.id;
+
+      const handleScanResponse = (response: any) => {
         setIsScanning(false);
         if (chrome.runtime.lastError || !response?.success) return;
 
@@ -77,6 +79,31 @@ function App() {
         setPreview(data);
         setEditCompany(data.companyName);
         setEditJobTitle(data.jobTitle);
+      };
+
+      // Try messaging the content script; if it's not there, inject it and retry
+      chrome.tabs.sendMessage(tabId, { action: 'scan_page' }, (response: any) => {
+        if (chrome.runtime.lastError) {
+          // Content script not loaded — inject it programmatically, then retry
+          const manifest = chrome.runtime.getManifest();
+          const contentScriptFiles = manifest.content_scripts?.[0]?.js || [];
+          if (contentScriptFiles.length === 0) {
+            setIsScanning(false);
+            return;
+          }
+          chrome.scripting.executeScript(
+            { target: { tabId }, files: contentScriptFiles },
+            () => {
+              if (chrome.runtime.lastError) {
+                setIsScanning(false);
+                return;
+              }
+              chrome.tabs.sendMessage(tabId, { action: 'scan_page' }, handleScanResponse);
+            }
+          );
+          return;
+        }
+        handleScanResponse(response);
       });
     });
   };
