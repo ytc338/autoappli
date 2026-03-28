@@ -20,6 +20,7 @@ function App() {
   const [preview, setPreview] = useState<ScanPreview | null>(null);
   const [editCompany, setEditCompany] = useState('');
   const [editJobTitle, setEditJobTitle] = useState('');
+  const [editDescription, setEditDescription] = useState('');
   const [isScanning, setIsScanning] = useState(false);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -59,26 +60,72 @@ function App() {
     }, 500);
   };
 
+  // Persist edits to storage so they survive popup close/reopen
+  const saveEditsToStorage = async (url: string, company: string, jobTitle: string, description: string) => {
+    const data = await storage.get(['scanPreviewEdits']);
+    const edits = data.scanPreviewEdits || {};
+    edits[url] = { companyName: company, jobTitle, description, timestamp: Date.now() };
+    await storage.set({ scanPreviewEdits: edits });
+  };
+
+  // Force a fresh scan, clearing saved edits for this URL
+  const rescanPreview = async () => {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const currentUrl = tabs[0]?.url;
+    if (currentUrl) {
+      const data = await storage.get(['scanPreviewEdits']);
+      const edits = data.scanPreviewEdits || {};
+      delete edits[currentUrl];
+      await storage.set({ scanPreviewEdits: edits });
+    }
+    runScanPreview();
+  };
+
+  // Apply scan data to state (used by both fresh scan and restore)
+  const applyScanData = (data: ScanPreview) => {
+    setPreview(data);
+    setEditCompany(data.companyName);
+    setEditJobTitle(data.jobTitle);
+    setEditDescription(data.description);
+  };
+
   // Auto-scan the page when popup opens to populate preview
   const runScanPreview = () => {
     setIsScanning(true);
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const currentTab = tabs[0];
       if (!currentTab?.id || currentTab.url?.startsWith('chrome://') || currentTab.url?.startsWith('edge://')) {
         setIsScanning(false);
         return;
       }
 
+      const currentUrl = currentTab.url || '';
       const tabId = currentTab.id;
+
+      // Check for saved edits first — restore them if they exist for this URL
+      const saved = await storage.get(['scanPreviewEdits']);
+      const edits = saved.scanPreviewEdits || {};
+      const savedEdit = edits[currentUrl];
+
+      if (savedEdit && savedEdit.timestamp && Date.now() - savedEdit.timestamp < TTL) {
+        const restoredData: ScanPreview = {
+          companyName: savedEdit.companyName,
+          jobTitle: savedEdit.jobTitle,
+          description: savedEdit.description,
+          url: currentUrl,
+        };
+        applyScanData(restoredData);
+        setIsScanning(false);
+        return;
+      }
 
       const handleScanResponse = (response: any) => {
         setIsScanning(false);
         if (chrome.runtime.lastError || !response?.success) return;
 
         const data = response.data as ScanPreview;
-        setPreview(data);
-        setEditCompany(data.companyName);
-        setEditJobTitle(data.jobTitle);
+        applyScanData(data);
+        saveEditsToStorage(currentUrl, data.companyName, data.jobTitle, data.description);
       };
 
       // Try messaging the content script; if it's not there, inject it and retry
@@ -204,7 +251,7 @@ function App() {
           scannedData: {
             companyName: editCompany || preview.companyName,
             jobTitle: editJobTitle || preview.jobTitle,
-            description: preview.description,
+            description: editDescription || preview.description,
             url: preview.url,
           },
         },
@@ -290,12 +337,24 @@ function App() {
                 <p className="text-xs text-slate-400 text-center py-2">Scanning page...</p>
               ) : preview ? (
                 <>
+                  <div className="flex justify-end">
+                    <button
+                      onClick={rescanPreview}
+                      className="text-xs text-slate-400 hover:text-indigo-600 transition-colors"
+                      title="Rescan page (discards edits)"
+                    >
+                      Rescan
+                    </button>
+                  </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-500 mb-0.5">Company</label>
                     <input
                       type="text"
                       value={editCompany}
-                      onChange={(e) => setEditCompany(e.target.value)}
+                      onChange={(e) => {
+                        setEditCompany(e.target.value);
+                        if (preview) saveEditsToStorage(preview.url, e.target.value, editJobTitle, editDescription);
+                      }}
                       className="w-full p-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
                     />
                   </div>
@@ -304,8 +363,32 @@ function App() {
                     <input
                       type="text"
                       value={editJobTitle}
-                      onChange={(e) => setEditJobTitle(e.target.value)}
+                      onChange={(e) => {
+                        setEditJobTitle(e.target.value);
+                        if (preview) saveEditsToStorage(preview.url, editCompany, e.target.value, editDescription);
+                      }}
                       className="w-full p-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-500 mb-0.5">Description</label>
+                    {!editDescription.trim() ? (
+                      <div className="p-2 bg-amber-50 border border-amber-300 rounded text-xs text-amber-700">
+                        No description detected. Paste the job description below for better results.
+                      </div>
+                    ) : editDescription.trim().length < 100 ? (
+                      <div className="p-1.5 bg-amber-50 border border-amber-200 rounded text-xs text-amber-600 mb-1">
+                        Description seems short — you can edit it below.
+                      </div>
+                    ) : null}
+                    <textarea
+                      value={editDescription}
+                      onChange={(e) => {
+                        setEditDescription(e.target.value);
+                        if (preview) saveEditsToStorage(preview.url, editCompany, editJobTitle, e.target.value);
+                      }}
+                      className="w-full h-20 p-1.5 border border-slate-300 rounded text-xs focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 resize-none"
+                      placeholder="Paste job description here..."
                     />
                   </div>
                 </>
