@@ -1,7 +1,9 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { generateAnswer } from '../utils/gemini';
 import type { ScannedData } from '../content/scanner';
 
 console.log('Background script initialized');
+
+const GENERATION_TIMEOUT_MS = 60_000;
 
 interface GenerationJob {
   status: 'scanning' | 'generating' | 'done' | 'error';
@@ -15,34 +17,13 @@ async function setJob(job: GenerationJob) {
   await chrome.storage.local.set({ generationJob: job });
 }
 
-async function generateAnswer(apiKey: string, resume: string, data: ScannedData): Promise<string> {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" });
-
-  const prompt = `
-Context: You are a helpful assistant for a job applicant. The user is applying for a job at "${data.companyName}" for the position of "${data.jobTitle}".
-
-Job Description Snippet:
-"${data.description.substring(0, 5000)}"
-
-User Resume:
-"${resume}"
-
-Task: Write a genuine, professional, and enthusiastic answer to the question "Why do you want to join us?" or "What interests you about this position?".
-
-Requirements:
-- Make a direct reference to the company's products, culture, or specific requirements mentioned in the job description.
-- Connect these details to the user's experience/skills in the resume.
-- Keep the tone personal and human, avoiding overused AI buzzwords (like "delve", "foster", "testament").
-- Keep it concise (around 100-150 words).
-- Output ONLY the answer text, no preamble or quotes.
-  `;
-
-  const result = await model.generateContent(prompt);
-  const response = await result.response;
-  const text = response.text().trim();
-  if (!text) throw new Error("Gemini returned empty response.");
-  return text;
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Generation timed out after ${ms / 1000}s`)), ms)
+    ),
+  ]);
 }
 
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
@@ -68,9 +49,12 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         }
 
         // Generate answer with Gemini
-        await setJob({ status: 'generating', url });
+        await setJob({ status: 'generating', url, timestamp: Date.now() });
 
-        const answer = await generateAnswer(apiKey, resume, scannedData);
+        const answer = await withTimeout(
+          generateAnswer(apiKey, resume, scannedData),
+          GENERATION_TIMEOUT_MS
+        );
 
         if (!answer) {
           throw new Error("Received empty answer from AI");

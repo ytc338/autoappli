@@ -26,6 +26,7 @@ function App() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+  const POLL_TIMEOUT_MS = 90_000;
 
   const stopPolling = () => {
     if (pollRef.current) {
@@ -34,12 +35,32 @@ function App() {
     }
   };
 
+  const abortGeneration = async (message: string) => {
+    setStatus(message);
+    setIsGenerating(false);
+    stopPolling();
+    await chrome.storage.local.remove('generationJob');
+  };
+
   const startPolling = () => {
     stopPolling();
+    const pollStart = Date.now();
     pollRef.current = setInterval(async () => {
+      // Stop polling if it has been running too long
+      if (Date.now() - pollStart > POLL_TIMEOUT_MS) {
+        await abortGeneration('Error: Generation timed out — please try again.');
+        return;
+      }
+
       const data = await storage.get(['generationJob']);
       const job = data.generationJob;
       if (!job) return;
+
+      // Detect stale jobs left by a crashed background worker
+      if (job.timestamp && Date.now() - job.timestamp > POLL_TIMEOUT_MS) {
+        await abortGeneration('Error: Generation timed out — please try again.');
+        return;
+      }
 
       if (job.status === 'scanning') {
         setStatus('Scanning page...');
@@ -165,6 +186,13 @@ function App() {
     storage.get(['generationJob']).then((data) => {
       const job = data.generationJob;
       if (job && (job.status === 'scanning' || job.status === 'generating')) {
+        // Discard stale jobs from a previous session / crashed worker.
+        // Jobs without a timestamp were created by an older version — always stale.
+        if (!job.timestamp || Date.now() - job.timestamp > POLL_TIMEOUT_MS) {
+          setStatus('Previous generation timed out.');
+          chrome.storage.local.remove('generationJob');
+          return;
+        }
         setIsGenerating(true);
         if (job.status === 'scanning') setStatus('Scanning page...');
         else setStatus('Generating answer with Gemini...');
